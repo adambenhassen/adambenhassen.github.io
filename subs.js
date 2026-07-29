@@ -6248,7 +6248,7 @@ var MatroskaSubtitles;
         }
         if (Lampa.Storage && Lampa.Storage.listener) {
             Lampa.Storage.listener.follow("change", function(e) {
-                if (e.name && e.name.indexOf("libass_") === 0) applyOurStyle();
+                if (e.name && e.name.indexOf("libass") === 0) applyOurStyle();
             });
         }
         if (Lampa.PlayerVideo && Lampa.PlayerVideo.listener) {
