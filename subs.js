@@ -4822,7 +4822,7 @@ var MatroskaSubtitles;
 
 (function() {
     "use strict";
-    var LIBASS_SUBS_VERSION = "1.0.5";
+    var LIBASS_SUBS_VERSION = "1.1.0";
     var DEBUG = false;
     try {
         DEBUG = localStorage.getItem("libass_debug") === "1";
@@ -4850,9 +4850,23 @@ var MatroskaSubtitles;
     };
     var aborter = null, curSrc = null, updTimer = null;
     var gen = 0;
+    // Bytes the file consumes in s seconds of playback (0 when the rate is unknown).
+    function secBytes(s) {
+        return duration && fileSize ? s * fileSize / duration : 0;
+    }
+    // Range-request granularity. Auto = ~6s of the stream (clamped 4–16MB) so a high-
+    // and a low-bitrate file overshoot the lookahead and load the server alike;
+    // below ~4MB per-request latency eats the bandwidth margin. A fixed size from
+    // settings overrides.
     function regionBytes() {
         var mb = window.Lampa && Lampa.Storage ? parseInt(Lampa.Storage.field("libass_region"), 10) : 0;
-        return (mb >= 2 && mb <= 24 ? mb : 12) * 1048576;
+        if (mb >= 2 && mb <= 24) return mb * 1048576;
+        var auto = secBytes(6);
+        return auto ? Math.min(16 * 1048576, Math.max(4 * 1048576, Math.round(auto))) : 12 * 1048576;
+    }
+    // How far behind the playhead the scan may fall before it gives up and jumps.
+    function driftBytes() {
+        return secBytes(10) || 2 * regionBytes();
     }
     function lookaheadSec() {
         var s = window.Lampa && Lampa.Storage ? parseInt(Lampa.Storage.field("libass_lookahead"), 10) : 0;
@@ -4904,6 +4918,19 @@ var MatroskaSubtitles;
     }
     function indexOfCluster(buf, from) {
         for (var i = from || 0; i < buf.length - 4; i++) if (buf[i] === CLUSTER_ID[0] && buf[i + 1] === CLUSTER_ID[1] && buf[i + 2] === CLUSTER_ID[2] && buf[i + 3] === CLUSTER_ID[3]) return i;
+        return -1;
+    }
+    // Last Cluster start in buf, validated as ID + size vint + Timecode (0xE7), or
+    // ffmpeg's CRC-32 (0xBF, 4 bytes) then Timecode, so video bytes that happen to
+    // spell the ID don't count. Needs 20 bytes of slack after the ID.
+    function lastClusterStart(buf) {
+        for (var i = buf.length - 21; i >= 0; i--) {
+            if (buf[i] !== CLUSTER_ID[0] || buf[i + 1] !== CLUSTER_ID[1] || buf[i + 2] !== CLUSTER_ID[2] || buf[i + 3] !== CLUSTER_ID[3]) continue;
+            var l = vintLen(buf[i + 4]);
+            if (l > 8) continue;
+            var c = i + 4 + l;
+            if (buf[c] === 231 || buf[c] === 191 && buf[c + 1] === 132 && buf[c + 6] === 231) return i;
+        }
         return -1;
     }
     function readFloat(buf, pos, len) {
@@ -5676,6 +5703,10 @@ var MatroskaSubtitles;
                 var saved = parseInt(localStorage.getItem(trackKey()), 10);
                 var saved2 = parseInt(localStorage.getItem(trackKey() + "_2"), 10);
                 if (saved2 >= 0 && tracks[saved2] && curTrack2 < 0) curTrack2 = saved2;
+                if (saved === -1) {
+                    manual = true;
+                    return;
+                }
                 if (saved >= 0 && tracks[saved]) {
                     manual = true;
                     renderTrack(v, saved);
@@ -5847,18 +5878,19 @@ var MatroskaSubtitles;
             opt("Time shift", "shift", SHIFTS, "0s (off)");
             opt("Background", "bg", BGS, "None");
             if (p === "libass") {
-                opt("Region size (RAM)", "region", {
-                    2: "2 MB (min RAM)",
+                opt("Region size", "region", {
+                    auto: "Auto (~6s of stream, default)",
+                    2: "2 MB",
                     4: "4 MB",
-                    6: "6 MB (low RAM)",
+                    6: "6 MB",
                     8: "8 MB",
                     10: "10 MB",
-                    12: "12 MB (default)",
+                    12: "12 MB",
                     16: "16 MB",
                     18: "18 MB",
                     20: "20 MB",
-                    24: "24 MB (risky)"
-                }, "12 MB (default)");
+                    24: "24 MB"
+                }, "Auto (~6s of stream, default)");
                 opt("Lookahead", "lookahead", {
                     10: "10s",
                     20: "20s (default)",
@@ -5998,7 +6030,7 @@ var MatroskaSubtitles;
                         subBox.__last = "";
                     }
                     try {
-                        localStorage.removeItem(trackKey());
+                        localStorage.setItem(trackKey(), -1);
                     } catch (e) {}
                     hud("subs OFF");
                 } else {
@@ -6138,7 +6170,7 @@ var MatroskaSubtitles;
         }
         if (!announced) hud("header parsed but no tracks event (truncated header?)");
     }
-    var regAborter = null, curFetchStart = -1;
+    var regAborter = null, curFetchStart = -1, curFetchGot = 0;
     var regFails = 0, regBackoffUntil = 0;
     var noDurWarned = false;
     function mergeRegions() {
@@ -6148,20 +6180,41 @@ var MatroskaSubtitles;
         for (var i = 0; i < fetchedRegions.length - 1; ) {
             if (fetchedRegions[i + 1].s <= fetchedRegions[i].e) {
                 fetchedRegions[i].e = Math.max(fetchedRegions[i].e, fetchedRegions[i + 1].e);
+                fetchedRegions[i].lc = Math.max(fetchedRegions[i].lc || -1, fetchedRegions[i + 1].lc || -1);
                 fetchedRegions.splice(i + 1, 1);
             } else i++;
         }
+    }
+    var contParser = null, contEnd = -1;
+    function dropRegionParser() {
+        if (contParser) {
+            try {
+                contParser.end();
+            } catch (e) {}
+            contParser = null;
+        }
+        contEnd = -1;
     }
     function fetchRegion(startByte) {
         if (fetching || !headerBytes || !streamUrl) return;
         if (Date.now() < regBackoffUntil) return;
         for (var i = 0; i < fetchedRegions.length; i++) if (startByte >= fetchedRegions[i].s && startByte < fetchedRegions[i].e) return;
+        // A fresh parser resyncs forward to the next Cluster, so extending a region
+        // without the parser that read it drops the cluster straddling the seam
+        // (seek back into old ground, aborted or failed fetch). Rewind the request to
+        // the last cluster start seen in that region so the seam cluster is re-read whole.
+        var from = startByte;
+        if (!(contParser && startByte === contEnd)) for (var j = 0; j < fetchedRegions.length; j++) if (fetchedRegions[j].e === startByte && fetchedRegions[j].lc > 0) {
+            from = fetchedRegions[j].lc;
+            break;
+        }
         fetching = true;
         curFetchStart = startByte;
+        curFetchGot = 0;
         regAborter = newAborter();
         var g = gen;
         var end = Math.min(fileSize - 1, startByte + regionBytes());
-        var lastProg = Date.now(), stalled = false;
+        var lastProg = Date.now(), stalled = false, t0 = Date.now();
         var wd = setInterval(function() {
             if (g !== gen || !fetching) {
                 clearInterval(wd);
@@ -6178,7 +6231,7 @@ var MatroskaSubtitles;
         }, 5e3);
         fetch(streamUrl, {
             headers: {
-                Range: "bytes=" + startByte + "-" + end
+                Range: "bytes=" + from + "-" + end
             },
             signal: regAborter && regAborter.signal
         }).then(function(res) {
@@ -6188,18 +6241,31 @@ var MatroskaSubtitles;
                 } catch (e) {}
                 throw new Error("http " + res.status);
             }
+            // Regions are cut on byte offsets, not cluster boundaries. When this one
+            // continues straight on from the last, keep its parser alive: starting a
+            // fresh one resyncs to the *next* cluster and silently drops every subtitle
+            // left in the cluster straddling the seam.
+            var cont = !!contParser && from === contEnd;
+            if (!cont) dropRegionParser();
             var reader = res.body.getReader();
-            var parser = null, pre = new Uint8Array(0), got = 0, ci = -1, perrLogged = false;
+            var parser = cont ? contParser : null, pre = new Uint8Array(0), got = 0, ci = cont ? 0 : -1, perrLogged = false;
+            var lc = -1, tail = new Uint8Array(0);
             function finish() {
                 clearInterval(wd);
                 if (g !== gen) return;
                 regFails = 0;
+                contParser = parser;
+                contEnd = parser ? from + got : -1;
                 fetchedRegions.push({
-                    s: startByte,
-                    e: startByte + got
+                    s: from,
+                    e: from + got,
+                    lc: lc
                 });
                 mergeRegions();
-                hud("region @" + (startByte / 1048576).toFixed(0) + "MB len=" + (got / 1048576).toFixed(0) + "MB cluster=" + ci);
+                // Throughput vs. the file's own byte rate: this scan has to keep up with
+                // playback byte-for-byte, so got/s below need/s means guaranteed gaps.
+                var secs = Math.max(.1, (Date.now() - t0) / 1e3);
+                hud("region @" + (startByte / 1048576).toFixed(0) + "MB len=" + (got / 1048576).toFixed(0) + "MB cluster=" + ci + (from < startByte ? " rewind=" + ((startByte - from) / 1048576).toFixed(1) + "MB" : "") + " " + secs.toFixed(0) + "s got=" + (got / 1048576 / secs).toFixed(2) + "MB/s need=" + (duration ? (fileSize / duration / 1048576).toFixed(2) : "?"));
                 fetching = false;
                 ensureRegionForTime(curTime());
             }
@@ -6213,16 +6279,24 @@ var MatroskaSubtitles;
                         return;
                     }
                     if (r.done) {
-                        try {
-                            if (parser) parser.end();
-                        } catch (e) {
-                            hud("region parse err (end): " + e.message);
-                        }
                         finish();
                         return;
                     }
                     var chunk = r.value;
                     got += chunk.length;
+                    curFetchGot = from - startByte + got;
+                    // Track the last cluster start. A start split across chunks is
+                    // caught by re-checking the previous chunk's tail joined to this head.
+                    var k = lastClusterStart(chunk), join = null;
+                    if (k >= 0) lc = from + got - chunk.length + k;
+                    if (tail.length) {
+                        join = new Uint8Array(tail.length + Math.min(20, chunk.length));
+                        join.set(tail);
+                        join.set(chunk.subarray(0, join.length - tail.length), tail.length);
+                        if (k < 0 && (k = lastClusterStart(join)) >= 0) lc = from + got - chunk.length - tail.length + k;
+                    }
+                    // Rolling tail: chunks can be tiny, so carry bytes across several of them.
+                    tail = chunk.length >= 20 ? chunk.subarray(chunk.length - 20) : (join || chunk).subarray(Math.max(0, (join || chunk).length - 20));
                     if (!parser) {
                         var buf = new Uint8Array(pre.length + chunk.length);
                         buf.set(pre);
@@ -6259,6 +6333,7 @@ var MatroskaSubtitles;
             clearInterval(wd);
             if (g !== gen) return;
             fetching = false;
+            dropRegionParser();
             if (stalled || !(e && e.name === "AbortError")) {
                 regFails++;
                 regBackoffUntil = Date.now() + Math.min(6e4, 1e3 * Math.pow(2, regFails));
@@ -6275,9 +6350,20 @@ var MatroskaSubtitles;
         if (!duration) return -1;
         return Math.max(0, Math.floor(t / duration * fileSize) - 2 * 1024 * 1024);
     }
+    // Upper bound for the data of time t: the first cue point past t (cue points sit
+    // at cluster starts, so the one before t can lag the real playhead by a keyframe
+    // interval plus a cluster — enough to swallow the whole lookahead), or EOF.
+    function byteAfterTime(t) {
+        if (cueIndex) {
+            for (var j = 0; j < cueIndex.length; j++) if (cueIndex[j].time > t) return cueIndex[j].byte;
+            return fileSize;
+        }
+        if (!duration) return -1;
+        return Math.min(fileSize, Math.floor(t / duration * fileSize) + 2 * 1024 * 1024);
+    }
     function ensureAhead(t) {
         if (!fileSize || fetching) return;
-        var bNow = byteForTime(t), bAhead = byteForTime(t + lookaheadSec());
+        var bNow = byteForTime(t), bAhead = byteAfterTime(t + lookaheadSec());
         if (bNow < 0) return;
         for (var i = 0; i < fetchedRegions.length; i++) {
             var r = fetchedRegions[i];
@@ -6298,10 +6384,30 @@ var MatroskaSubtitles;
             return;
         }
         target = Math.min(fileSize - 1, target);
-        var margin = Math.min(4 * 1024 * 1024, regionBytes() / 2);
-        for (var i = 0; i < fetchedRegions.length; i++) if (target >= fetchedRegions[i].s && target < fetchedRegions[i].e - margin) return;
+        var margin = Math.min(4 * 1024 * 1024, regionBytes() / 2), inside = false;
+        for (var i = 0; i < fetchedRegions.length; i++) if (target >= fetchedRegions[i].s && target < fetchedRegions[i].e) {
+            if (target < fetchedRegions[i].e - margin) return;
+            inside = true;
+        }
+        // Chain end only a few seconds behind the playhead (slow fetch, stall, backoff):
+        // continue it rather than jump. A jump skips [chainEnd, target), and lines due
+        // now sit there — muxers place subtitle blocks a second or two ahead of their
+        // start time. A larger backlog still jumps, or everything after it runs late.
+        var slack = secBytes(3) || regionBytes() / 4, behind = null;
+        var span = Math.max(slack, driftBytes());
+        if (!inside) for (var k = 0; k < fetchedRegions.length; k++) if (target >= fetchedRegions[k].e && target - fetchedRegions[k].e <= span && (!behind || fetchedRegions[k].e > behind.e)) behind = fetchedRegions[k];
+        if (behind && !fetching && behind.e < fileSize - 1) {
+            if (target - behind.e <= slack) {
+                fetchRegion(behind.e);
+                return;
+            }
+            if (Date.now() >= regBackoffUntil) hud("behind " + ((target - behind.e) / 1048576).toFixed(1) + "MB — jump to @" + (target / 1048576).toFixed(0) + "MB");
+        }
         if (fetching) {
-            if (regAborter && Math.abs(target - curFetchStart) > 2 * regionBytes()) {
+            // Behind = playhead past the fetch frontier; ahead = playhead before the region.
+            var frontier = curFetchStart + Math.max(0, curFetchGot);
+            if (regAborter && (target - frontier > driftBytes() || !inside && curFetchStart - target > driftBytes())) {
+                hud("drift " + ((target - frontier) / 1048576).toFixed(0) + "MB — abort region @" + (curFetchStart / 1048576).toFixed(0) + "MB");
                 try {
                     regAborter.abort();
                 } catch (e) {}
@@ -6403,6 +6509,7 @@ var MatroskaSubtitles;
             } catch (e) {}
             regAborter = null;
         }
+        dropRegionParser();
         if (timeLoop) {
             clearInterval(timeLoop);
             timeLoop = null;
@@ -6459,10 +6566,10 @@ var MatroskaSubtitles;
         curSrc = src;
         hud("video src: " + src);
         var same = src.indexOf(location.origin) === 0;
-        var looksTorrent = /\/(ts|stream)\//i.test(src) || /link=/i.test(src);
+        var looksStream = /\/(ts|stream)\//i.test(src) || /link=/i.test(src);
         var youtube = /youtube|googlevideo|\.m3u8.*yt/i.test(src);
         if (youtube) return hud("skip: youtube");
-        if (!same && !looksTorrent) return hud("skip: not same-origin/torrent (adjust filter)");
+        if (!same && !looksStream) return hud("skip: not same-origin/stream URL (adjust filter)");
         extract(v, src);
     }
     function patch() {
